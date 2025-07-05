@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/bwmarrin/discordgo"
+	"github.com/pion/opus"
 )
 
 const (
@@ -19,6 +20,11 @@ const (
 	// Audio processing constants
 	minAudioDurationSeconds = 0.5
 	opusPacketDurationMs    = 20 // Each Opus packet is typically 20ms
+
+	// Discord audio format
+	discordSampleRate = 48000
+	discordChannels   = 2
+	discordFrameSize  = 960 // 20ms at 48kHz
 )
 
 // Processor handles audio processing from Discord voice channels
@@ -32,14 +38,21 @@ type Processor struct {
 
 	// Audio buffer for raw PCM data
 	audioBuffer *bytes.Buffer
+
+	// Opus decoder
+	opusDecoder opus.Decoder
 }
 
 // New creates a new audio processor
 func New(debug bool) *Processor {
+	// Create Opus decoder for Discord audio (48kHz, 2 channels)
+	decoder := opus.NewDecoder()
+
 	return &Processor{
 		debug:        debug,
 		isProcessing: false,
 		audioBuffer:  new(bytes.Buffer),
+		opusDecoder:  decoder,
 	}
 }
 
@@ -79,34 +92,31 @@ func (p *Processor) StopProcessing() {
 
 	p.isProcessing = false
 	p.voiceConnection = nil
+
+	// Reset audio buffer
 	p.audioBuffer.Reset()
 
 	if p.debug {
-		log.Printf("Stopped audio processing")
+		log.Printf("Audio processing stopped")
 	}
 }
 
 // processAudioPackets processes incoming audio packets
 func (p *Processor) processAudioPackets() {
+	if p.voiceConnection == nil {
+		return
+	}
+
 	if p.debug {
 		log.Printf("Started audio packet processing")
 	}
 
 	for {
-		p.mutex.RLock()
-		if !p.isProcessing || p.voiceConnection == nil {
-			p.mutex.RUnlock()
-			break
-		}
-		vc := p.voiceConnection
-		p.mutex.RUnlock()
-
-		// Receive audio packets
 		select {
-		case packet, ok := <-vc.OpusRecv:
-			if !ok {
+		case packet := <-p.voiceConnection.OpusRecv:
+			if !p.isProcessing {
 				if p.debug {
-					log.Printf("Audio channel closed")
+					log.Printf("Audio processing stopped, exiting packet processing loop")
 				}
 				return
 			}
@@ -116,10 +126,6 @@ func (p *Processor) processAudioPackets() {
 		default:
 			// Continue listening
 		}
-	}
-
-	if p.debug {
-		log.Printf("Audio packet processing stopped")
 	}
 }
 
@@ -175,16 +181,34 @@ func (p *Processor) handleSilenceDetection() {
 }
 
 // processAudioBuffer processes the accumulated audio buffer
-// This method can be extended to integrate speech-to-text services
 func (p *Processor) processAudioBuffer() {
 	if p.debug {
 		log.Printf("Processing audio buffer with %d bytes of Opus data", p.audioBuffer.Len())
 	}
 
-	// Current implementation stores raw Opus data
-	// Future enhancements could include:
-	// - Opus to PCM decoding
-	// - Speech-to-text processing
-	// - D&D content analysis
-	// - AI-powered DM suggestions
+	// Convert Opus to PCM if we have audio data
+	if p.audioBuffer.Len() > 0 {
+		opusData := p.audioBuffer.Bytes()
+
+		// Decode Opus to PCM
+		// The Pion Opus decoder expects a proper buffer for output
+		pcmBuffer := make([]byte, len(opusData)*4) // Estimate PCM size
+		bandwidth, isStereo, err := p.opusDecoder.Decode(opusData, pcmBuffer)
+		if err != nil {
+			if p.debug {
+				log.Printf("Failed to decode Opus audio: %v", err)
+			}
+			return
+		}
+
+		if p.debug {
+			log.Printf("Decoded %d bytes of Opus to PCM (bandwidth: %v, stereo: %v)", len(opusData), bandwidth, isStereo)
+		}
+
+		// TODO: Here you can send pcmBuffer to speech recognition service
+		// For now, we just log that we have processed audio
+		if p.debug {
+			log.Printf("Successfully processed audio segment of %d PCM bytes", len(pcmBuffer))
+		}
+	}
 }

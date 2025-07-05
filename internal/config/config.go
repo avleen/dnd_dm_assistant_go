@@ -18,6 +18,10 @@ type Config struct {
 	DNDVoiceChannelID string
 	CommandPrefix     string
 	Debug             bool
+
+	// Google Cloud Speech-to-Text
+	GoogleProjectID string
+	GoogleCredsPath string
 }
 
 const (
@@ -71,6 +75,10 @@ func Load() (*Config, error) {
 		DNDVoiceChannelID: os.Getenv("DND_VOICE_CHANNEL_ID"),
 		CommandPrefix:     getEnvWithDefault("COMMAND_PREFIX", "!dnd"),
 		Debug:             debug,
+
+		// Google Cloud Speech-to-Text
+		GoogleProjectID: os.Getenv("GOOGLE_PROJECT_ID"),
+		GoogleCredsPath: os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
 	}
 
 	// Validate configuration

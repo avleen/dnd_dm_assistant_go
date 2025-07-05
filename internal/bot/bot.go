@@ -8,6 +8,7 @@ import (
 
 	"dnd_dm_assistant_go/internal/audio"
 	"dnd_dm_assistant_go/internal/config"
+	"dnd_dm_assistant_go/internal/speech"
 
 	"github.com/bwmarrin/discordgo"
 )
@@ -28,6 +29,7 @@ type Bot struct {
 	config         *config.Config
 	session        *discordgo.Session
 	audioProcessor *audio.Processor
+	speechService  *speech.Service
 }
 
 // New creates a new Bot instance
@@ -41,6 +43,18 @@ func New(cfg *config.Config) (*Bot, error) {
 	// Set intents
 	session.Identify.Intents = discordgo.IntentsAll
 
+	// Create speech service if Google Cloud credentials are available
+	var speechService *speech.Service
+	if cfg.GoogleProjectID != "" {
+		speechService, err = speech.NewService(cfg.GoogleProjectID, cfg.Debug)
+		if err != nil {
+			log.Printf("Warning: Failed to create speech service: %v", err)
+			speechService = nil
+		} else {
+			log.Printf("Speech service created successfully")
+		}
+	}
+
 	// Create audio processor
 	audioProcessor := audio.New(cfg.Debug)
 
@@ -48,6 +62,7 @@ func New(cfg *config.Config) (*Bot, error) {
 		config:         cfg,
 		session:        session,
 		audioProcessor: audioProcessor,
+		speechService:  speechService,
 	}
 
 	// Set up event handlers
@@ -78,6 +93,12 @@ func (b *Bot) Stop() {
 	if b.audioProcessor != nil {
 		log.Printf("Stopping audio processing...")
 		b.audioProcessor.StopProcessing()
+	}
+
+	// Close speech service
+	if b.speechService != nil {
+		log.Printf("Closing speech service...")
+		b.speechService.Close()
 	}
 
 	// Disconnect from all voice channels
