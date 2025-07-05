@@ -46,13 +46,36 @@ func New(cfg *config.Config) (*Bot, error) {
 	// Create speech service if Google Cloud credentials are available
 	var speechService *speech.Service
 	if cfg.GoogleProjectID != "" {
+		log.Printf("🔧 Attempting to create speech service with project ID: %s", cfg.GoogleProjectID)
+
+		// Check if credentials file exists if specified
+		if cfg.GoogleCredsPath != "" {
+			log.Printf("🔧 Using credentials file: %s", cfg.GoogleCredsPath)
+		} else {
+			log.Printf("🔧 Using default credentials (ADC/environment)")
+		}
+
 		speechService, err = speech.NewService(cfg.GoogleProjectID, cfg.Debug)
 		if err != nil {
-			log.Printf("Warning: Failed to create speech service: %v", err)
+			log.Printf("❌ Warning: Failed to create speech service: %v", err)
+			log.Printf("   📋 Troubleshooting steps:")
+			log.Printf("   1. Ensure GOOGLE_PROJECT_ID is set to your GCP project ID")
+			log.Printf("   2. Set up authentication:")
+			log.Printf("      • Set GOOGLE_APPLICATION_CREDENTIALS to path of service account JSON file")
+			log.Printf("      • OR run 'gcloud auth application-default login'")
+			log.Printf("      • OR use GCE/Cloud Run default credentials")
+			if cfg.GoogleCredsPath != "" {
+				log.Printf("   3. Check that credentials file exists: %s", cfg.GoogleCredsPath)
+			}
+			log.Printf("   🔗 See: https://cloud.google.com/docs/authentication/getting-started")
+			log.Printf("   ⚠️  The bot will continue without speech-to-text functionality.")
 			speechService = nil
 		} else {
-			log.Printf("Speech service created successfully")
+			log.Printf("✅ Speech service created successfully")
 		}
+	} else {
+		log.Printf("ℹ️  Google Project ID not configured - speech service disabled")
+		log.Printf("   Set GOOGLE_PROJECT_ID environment variable to enable speech-to-text")
 	}
 
 	// Create audio processor
@@ -226,9 +249,15 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, m *discordgo.MessageCrea
 	status += fmt.Sprintf("🎯 Target Voice Channel: <#%s>\n", b.config.DNDVoiceChannelID)
 
 	if b.audioProcessor.IsProcessing() {
-		status += "🎤 Currently processing audio"
+		status += "🎤 Currently processing audio\n"
 	} else {
-		status += "⏸️ Not processing audio"
+		status += "⏸️ Not processing audio\n"
+	}
+
+	if b.speechService != nil {
+		status += "🗣️ Speech-to-text service: ✅ Active"
+	} else {
+		status += "🗣️ Speech-to-text service: ❌ Disabled"
 	}
 
 	s.ChannelMessageSend(m.ChannelID, status)
@@ -317,14 +346,18 @@ func (b *Bot) isDMInTargetChannel(guild *discordgo.Guild) bool {
 func (b *Bot) joinVoiceChannel(guildID, channelID string) {
 	log.Printf("Attempting to join voice channel %s in guild %s", channelID, guildID)
 
-	// Join the voice channel
-	vc, err := b.session.ChannelVoiceJoin(guildID, channelID, false, true)
+	// Join the voice channel with listening enabled
+	// Parameters: guildID, channelID, mute=false, deaf=false
+	vc, err := b.session.ChannelVoiceJoin(guildID, channelID, false, false)
 	if err != nil {
 		log.Printf("Error joining voice channel: %v", err)
 		return
 	}
 
-	log.Printf("Successfully joined voice channel")
+	log.Printf("Successfully joined voice channel (listening enabled)")
+	if b.config.Debug {
+		log.Printf("Voice connection details: Ready=%v, UserID=%s", vc.Ready, vc.UserID)
+	}
 
 	// Start audio processing
 	if err := b.audioProcessor.StartProcessing(vc); err != nil {

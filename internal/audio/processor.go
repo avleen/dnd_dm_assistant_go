@@ -5,10 +5,36 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/bwmarrin/discordgo"
 	"github.com/pion/opus"
 )
+
+// New creates a new audio processor
+func New(debug bool) *Processor {
+	// Create Opus decoder for Discord audio (48kHz, 2 channels)
+	decoder := opus.NewDecoder()
+
+	processor := &Processor{
+		debug:        debug,
+		isProcessing: false,
+		audioBuffer:  new(bytes.Buffer),
+		opusDecoder:  decoder,
+		// Initialize debug counters
+		packetsReceived:   0,
+		silenceDetections: 0,
+		audioSegments:     0,
+		totalBytesOpus:    0,
+		totalBytesPCM:     0,
+	}
+
+	if debug {
+		log.Printf("[AUDIO] Created new audio processor with debug logging enabled")
+	}
+
+	return processor
+}
 
 const (
 	// Discord audio constants
@@ -41,19 +67,13 @@ type Processor struct {
 
 	// Opus decoder
 	opusDecoder opus.Decoder
-}
 
-// New creates a new audio processor
-func New(debug bool) *Processor {
-	// Create Opus decoder for Discord audio (48kHz, 2 channels)
-	decoder := opus.NewDecoder()
-
-	return &Processor{
-		debug:        debug,
-		isProcessing: false,
-		audioBuffer:  new(bytes.Buffer),
-		opusDecoder:  decoder,
-	}
+	// Debug counters
+	packetsReceived   int64
+	silenceDetections int64
+	audioSegments     int64
+	totalBytesOpus    int64
+	totalBytesPCM     int64
 }
 
 // IsProcessing returns whether audio processing is active
@@ -74,6 +94,20 @@ func (p *Processor) StartProcessing(vc *discordgo.VoiceConnection) error {
 
 	p.voiceConnection = vc
 	p.isProcessing = true
+
+	// Reset debug counters
+	p.packetsReceived = 0
+	p.silenceDetections = 0
+	p.audioSegments = 0
+	p.totalBytesOpus = 0
+	p.totalBytesPCM = 0
+
+	log.Printf("[AUDIO] ✅ Starting audio processing stream")
+	if p.debug {
+		log.Printf("[AUDIO] Voice connection guild: %s, channel: %s", vc.GuildID, vc.ChannelID)
+		log.Printf("[AUDIO] Audio format: %dHz, %d channels, %dms packets",
+			discordSampleRate, discordChannels, opusPacketDurationMs)
+	}
 
 	// Start processing audio packets in a goroutine
 	go p.processAudioPackets()
@@ -96,35 +130,66 @@ func (p *Processor) StopProcessing() {
 	// Reset audio buffer
 	p.audioBuffer.Reset()
 
+	log.Printf("[AUDIO] ⏹️ Stopped audio processing stream")
 	if p.debug {
-		log.Printf("Audio processing stopped")
+		log.Printf("[AUDIO] Final stats: %d packets, %d silence detections, %d audio segments",
+			p.packetsReceived, p.silenceDetections, p.audioSegments)
+		log.Printf("[AUDIO] Data processed: %d bytes Opus → %d bytes PCM",
+			p.totalBytesOpus, p.totalBytesPCM)
 	}
 }
 
 // processAudioPackets processes incoming audio packets
 func (p *Processor) processAudioPackets() {
 	if p.voiceConnection == nil {
+		log.Printf("[AUDIO] ❌ No voice connection available")
 		return
 	}
 
+	log.Printf("[AUDIO] 🎧 Started audio packet processing loop")
 	if p.debug {
-		log.Printf("Started audio packet processing")
+		log.Printf("[AUDIO] Listening for Opus packets on voice connection...")
+		log.Printf("[AUDIO] Voice connection ready: %v", p.voiceConnection.Ready)
+		log.Printf("[AUDIO] OpusRecv channel: %p", p.voiceConnection.OpusRecv)
 	}
+
+	// Set up a ticker to log status every 10 seconds if no audio is received
+	packetCount := int64(0)
+	lastStatusTime := time.Now()
 
 	for {
 		select {
 		case packet := <-p.voiceConnection.OpusRecv:
 			if !p.isProcessing {
-				if p.debug {
-					log.Printf("Audio processing stopped, exiting packet processing loop")
-				}
+				log.Printf("[AUDIO] 🛑 Audio processing stopped, exiting packet loop")
 				return
+			}
+
+			packetCount++
+			if packetCount == 1 {
+				log.Printf("[AUDIO] 🎉 First audio packet received!")
 			}
 
 			p.processAudioPacket(packet)
 
 		default:
-			// Continue listening
+			// Check if we should continue processing
+			if !p.isProcessing {
+				log.Printf("[AUDIO] 🛑 Audio processing stopped, exiting packet loop")
+				return
+			}
+
+			// Log status every 10 seconds if no packets received
+			if time.Since(lastStatusTime) > 10*time.Second {
+				if packetCount == 0 {
+					log.Printf("[AUDIO] ⏳ Still waiting for audio packets... (connection ready: %v)",
+						p.voiceConnection.Ready)
+				}
+				lastStatusTime = time.Now()
+			}
+
+			// Brief sleep to prevent busy waiting
+			time.Sleep(1 * time.Millisecond)
 		}
 	}
 }
@@ -135,17 +200,30 @@ func (p *Processor) processAudioPacket(packet *discordgo.Packet) {
 		return
 	}
 
+	// Update counters
+	p.packetsReceived++
+
+	// Check for Discord silence detection packets first
+	if p.isSilencePacket(packet) {
+		p.handleSilenceDetection()
+		return
+	}
+
 	// Log audio reception for debugging
 	if p.debug {
-		log.Printf("Received audio packet from SSRC %d, size: %d bytes", packet.SSRC, len(packet.Opus))
+		log.Printf("[AUDIO] 📦 Packet #%d from SSRC %d: %d bytes",
+			p.packetsReceived, packet.SSRC, len(packet.Opus))
 	}
 
 	// Store the raw opus data for processing
 	p.audioBuffer.Write(packet.Opus)
+	p.totalBytesOpus += int64(len(packet.Opus))
 
-	// Check for Discord silence detection packets
-	if p.isSilencePacket(packet) {
-		p.handleSilenceDetection()
+	// Every 50 packets (1 second), log buffer status
+	if p.debug && p.packetsReceived%50 == 0 {
+		estimatedDuration := float32(p.packetsReceived) * float32(opusPacketDurationMs) / 1000.0
+		log.Printf("[AUDIO] 📊 Buffer status: %d bytes, ~%.1fs recorded",
+			p.audioBuffer.Len(), estimatedDuration)
 	}
 }
 
@@ -159,21 +237,26 @@ func (p *Processor) isSilencePacket(packet *discordgo.Packet) bool {
 
 // handleSilenceDetection processes accumulated audio when silence is detected
 func (p *Processor) handleSilenceDetection() {
-	if p.debug {
-		log.Printf("Silence detected")
-	}
+	p.silenceDetections++
+
+	log.Printf("[AUDIO] 🔇 Silence detection #%d - processing audio segment", p.silenceDetections)
 
 	// Calculate approximate duration (each packet is ~20ms)
 	estimatedPackets := p.audioBuffer.Len() / 100 // Rough bytes per packet
 	estimatedDuration := float32(estimatedPackets) * float32(opusPacketDurationMs) / 1000.0
 
 	if p.debug {
-		log.Printf("Audio buffer contains approximately %.2f seconds of audio", estimatedDuration)
+		log.Printf("[AUDIO] Audio segment contains ~%d packets (%.2f seconds, %d bytes)",
+			estimatedPackets, estimatedDuration, p.audioBuffer.Len())
 	}
 
 	// Process audio if we have sufficient duration
 	if estimatedDuration >= minAudioDurationSeconds {
+		log.Printf("[AUDIO] ✅ Processing audio segment (>%.1fs threshold)", minAudioDurationSeconds)
 		p.processAudioBuffer()
+	} else if p.debug {
+		log.Printf("[AUDIO] ⏭️ Skipping short audio segment (%.2fs < %.1fs threshold)",
+			estimatedDuration, minAudioDurationSeconds)
 	}
 
 	// Reset buffer for next audio segment
@@ -182,9 +265,10 @@ func (p *Processor) handleSilenceDetection() {
 
 // processAudioBuffer processes the accumulated audio buffer
 func (p *Processor) processAudioBuffer() {
-	if p.debug {
-		log.Printf("Processing audio buffer with %d bytes of Opus data", p.audioBuffer.Len())
-	}
+	p.audioSegments++
+
+	log.Printf("[AUDIO] 🎵 Processing audio segment #%d (%d bytes Opus)",
+		p.audioSegments, p.audioBuffer.Len())
 
 	// Convert Opus to PCM if we have audio data
 	if p.audioBuffer.Len() > 0 {
@@ -195,20 +279,19 @@ func (p *Processor) processAudioBuffer() {
 		pcmBuffer := make([]byte, len(opusData)*4) // Estimate PCM size
 		bandwidth, isStereo, err := p.opusDecoder.Decode(opusData, pcmBuffer)
 		if err != nil {
-			if p.debug {
-				log.Printf("Failed to decode Opus audio: %v", err)
-			}
+			log.Printf("[AUDIO] ❌ Failed to decode Opus audio: %v", err)
 			return
 		}
 
-		if p.debug {
-			log.Printf("Decoded %d bytes of Opus to PCM (bandwidth: %v, stereo: %v)", len(opusData), bandwidth, isStereo)
-		}
+		p.totalBytesPCM += int64(len(pcmBuffer))
+
+		log.Printf("[AUDIO] ✅ Segment #%d decoded: %d bytes Opus → %d bytes PCM (bandwidth: %v, stereo: %v)",
+			p.audioSegments, len(opusData), len(pcmBuffer), bandwidth, isStereo)
 
 		// TODO: Here you can send pcmBuffer to speech recognition service
 		// For now, we just log that we have processed audio
 		if p.debug {
-			log.Printf("Successfully processed audio segment of %d PCM bytes", len(pcmBuffer))
+			log.Printf("[AUDIO] 📤 Ready to send %d bytes PCM to speech service", len(pcmBuffer))
 		}
 	}
 }
