@@ -9,6 +9,18 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
+const (
+	// Discord audio constants
+	discordSilencePacketSize = 3
+	discordSilenceMarker1    = 248
+	discordSilenceMarker2    = 255
+	discordSilenceMarker3    = 254
+
+	// Audio processing constants
+	minAudioDurationSeconds = 0.5
+	opusPacketDurationMs    = 20 // Each Opus packet is typically 20ms
+)
+
 // Processor handles audio processing from Discord voice channels
 type Processor struct {
 	debug        bool
@@ -117,52 +129,62 @@ func (p *Processor) processAudioPacket(packet *discordgo.Packet) {
 		return
 	}
 
-	// For now, just log that we received audio
+	// Log audio reception for debugging
 	if p.debug {
 		log.Printf("Received audio packet from SSRC %d, size: %d bytes", packet.SSRC, len(packet.Opus))
 	}
 
-	// TODO: Decode Opus to PCM when opus decoder is available
-	// For now, just store the raw opus data
+	// Store the raw opus data for processing
 	p.audioBuffer.Write(packet.Opus)
 
-	// Calculate approximate duration based on packet size (rough estimation)
-	// Each opus packet is typically 20ms of audio
-	packetCount := p.audioBuffer.Len() / 100 // rough estimation
-	duration := float32(packetCount) * 0.02  // 20ms per packet
-
-	if p.debug && duration > 1.0 { // Log every second of audio
-		log.Printf("Audio buffer duration: approximately %.2f seconds", duration)
-	}
-
-	// Check for silence detection (Discord sends specific silence packets)
-	if len(packet.Opus) == 3 && packet.Opus[0] == 248 && packet.Opus[1] == 255 && packet.Opus[2] == 254 {
-		if p.debug {
-			log.Printf("Silence detected, buffer has approximately %.2f seconds of audio", duration)
-		}
-
-		// Here you would typically process the accumulated audio
-		// For now, we'll just reset the buffer
-		if duration > 0.5 { // Only process if we have at least 500ms of audio
-			p.processAudioBuffer()
-		}
-
-		p.audioBuffer.Reset()
+	// Check for Discord silence detection packets
+	if p.isSilencePacket(packet) {
+		p.handleSilenceDetection()
 	}
 }
 
-// processAudioBuffer processes the accumulated audio buffer
-func (p *Processor) processAudioBuffer() {
+// isSilencePacket checks if the packet indicates silence
+func (p *Processor) isSilencePacket(packet *discordgo.Packet) bool {
+	return len(packet.Opus) == discordSilencePacketSize &&
+		packet.Opus[0] == discordSilenceMarker1 &&
+		packet.Opus[1] == discordSilenceMarker2 &&
+		packet.Opus[2] == discordSilenceMarker3
+}
+
+// handleSilenceDetection processes accumulated audio when silence is detected
+func (p *Processor) handleSilenceDetection() {
 	if p.debug {
-		log.Printf("Processing audio buffer with %d bytes", p.audioBuffer.Len())
+		log.Printf("Silence detected")
 	}
 
-	// TODO: This is where you would add speech-to-text processing
-	// For now, we just acknowledge that we have audio to process
+	// Calculate approximate duration (each packet is ~20ms)
+	estimatedPackets := p.audioBuffer.Len() / 100 // Rough bytes per packet
+	estimatedDuration := float32(estimatedPackets) * float32(opusPacketDurationMs) / 1000.0
 
-	// Future implementations could:
-	// 1. Send audio to a speech-to-text service
-	// 2. Process the transcription for D&D-related content
-	// 3. Generate AI-powered DM suggestions
-	// 4. Send helpful messages back to Discord
+	if p.debug {
+		log.Printf("Audio buffer contains approximately %.2f seconds of audio", estimatedDuration)
+	}
+
+	// Process audio if we have sufficient duration
+	if estimatedDuration >= minAudioDurationSeconds {
+		p.processAudioBuffer()
+	}
+
+	// Reset buffer for next audio segment
+	p.audioBuffer.Reset()
+}
+
+// processAudioBuffer processes the accumulated audio buffer
+// This method can be extended to integrate speech-to-text services
+func (p *Processor) processAudioBuffer() {
+	if p.debug {
+		log.Printf("Processing audio buffer with %d bytes of Opus data", p.audioBuffer.Len())
+	}
+
+	// Current implementation stores raw Opus data
+	// Future enhancements could include:
+	// - Opus to PCM decoding
+	// - Speech-to-text processing
+	// - D&D content analysis
+	// - AI-powered DM suggestions
 }

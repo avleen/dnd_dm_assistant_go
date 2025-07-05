@@ -12,6 +12,17 @@ import (
 	"github.com/bwmarrin/discordgo"
 )
 
+const (
+	// Startup delay to allow Discord state to stabilize
+	startupDelay = 2 * time.Second
+
+	// Command names
+	commandJoin   = "join"
+	commandLeave  = "leave"
+	commandStatus = "status"
+	commandHelp   = "help"
+)
+
 // Bot represents the D&D DM Assistant Discord bot
 type Bot struct {
 	config         *config.Config
@@ -148,13 +159,13 @@ func (b *Bot) handleCommand(s *discordgo.Session, m *discordgo.MessageCreate) {
 	command := strings.ToLower(args[0])
 
 	switch command {
-	case "join":
+	case commandJoin:
 		b.handleJoinCommand(s, m)
-	case "leave":
+	case commandLeave:
 		b.handleLeaveCommand(s, m)
-	case "status":
+	case commandStatus:
 		b.handleStatusCommand(s, m)
-	case "help":
+	case commandHelp:
 		b.handleHelpCommand(s, m)
 	}
 }
@@ -164,7 +175,8 @@ func (b *Bot) handleJoinCommand(s *discordgo.Session, m *discordgo.MessageCreate
 	// Find the guild
 	guild, err := s.State.Guild(m.GuildID)
 	if err != nil {
-		log.Printf("Error finding guild: %v", err)
+		log.Printf("Error finding guild %s: %v", m.GuildID, err)
+		s.ChannelMessageSend(m.ChannelID, "❌ Unable to access guild information.")
 		return
 	}
 
@@ -172,17 +184,18 @@ func (b *Bot) handleJoinCommand(s *discordgo.Session, m *discordgo.MessageCreate
 	for _, vs := range guild.VoiceStates {
 		if vs.UserID == m.Author.ID {
 			b.joinVoiceChannel(guild.ID, vs.ChannelID)
+			s.ChannelMessageSend(m.ChannelID, "✅ Joined your voice channel!")
 			return
 		}
 	}
 
-	s.ChannelMessageSend(m.ChannelID, "You need to be in a voice channel first!")
+	s.ChannelMessageSend(m.ChannelID, "❌ You need to be in a voice channel first!")
 }
 
 // handleLeaveCommand handles the leave command
 func (b *Bot) handleLeaveCommand(s *discordgo.Session, m *discordgo.MessageCreate) {
 	b.leaveVoiceChannel(m.GuildID)
-	s.ChannelMessageSend(m.ChannelID, "Left the voice channel.")
+	s.ChannelMessageSend(m.ChannelID, "✅ Left the voice channel.")
 }
 
 // handleStatusCommand handles the status command
@@ -202,11 +215,11 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, m *discordgo.MessageCrea
 
 // handleHelpCommand handles the help command
 func (b *Bot) handleHelpCommand(s *discordgo.Session, m *discordgo.MessageCreate) {
-	help := fmt.Sprintf("**D&D DM Assistant Bot Commands**\n\n")
-	help += fmt.Sprintf("`%s join` - Join your current voice channel\n", b.config.CommandPrefix)
-	help += fmt.Sprintf("`%s leave` - Leave the current voice channel\n", b.config.CommandPrefix)
-	help += fmt.Sprintf("`%s status` - Show bot status\n", b.config.CommandPrefix)
-	help += fmt.Sprintf("`%s help` - Show this help message\n", b.config.CommandPrefix)
+	help := "**D&D DM Assistant Bot Commands**\n\n"
+	help += fmt.Sprintf("`%s %s` - Join your current voice channel\n", b.config.CommandPrefix, commandJoin)
+	help += fmt.Sprintf("`%s %s` - Leave the current voice channel\n", b.config.CommandPrefix, commandLeave)
+	help += fmt.Sprintf("`%s %s` - Show bot status\n", b.config.CommandPrefix, commandStatus)
+	help += fmt.Sprintf("`%s %s` - Show this help message\n", b.config.CommandPrefix, commandHelp)
 	help += "\n**Automatic Features:**\n"
 	help += fmt.Sprintf("- Bot automatically joins when <@%s> joins <#%s>\n", b.config.DMUserID, b.config.DNDVoiceChannelID)
 
@@ -214,101 +227,75 @@ func (b *Bot) handleHelpCommand(s *discordgo.Session, m *discordgo.MessageCreate
 }
 
 // checkDMInVoiceChannelAsync checks if the DM is already in the target voice channel
-// This function fetches fresh guild data to ensure accurate voice state information
 func (b *Bot) checkDMInVoiceChannelAsync() {
 	log.Printf("Checking if DM is already in the target voice channel...")
 
-	// Wait a moment for Discord state to stabilize after connection
-	time.Sleep(2 * time.Second)
+	// Wait for Discord state to stabilize after connection
+	time.Sleep(startupDelay)
 
 	// Check each guild the bot is in
 	for _, guild := range b.session.State.Guilds {
-		log.Printf("Checking guild: %s (ID: %s)", guild.Name, guild.ID)
+		if b.config.Debug {
+			log.Printf("Checking guild: %s (ID: %s)", guild.Name, guild.ID)
+		}
 
-		// Check if the target voice channel exists in this guild
-		targetChannel, err := b.session.Channel(b.config.DNDVoiceChannelID)
-		if err != nil {
-			log.Printf("Could not fetch target channel %s: %v", b.config.DNDVoiceChannelID, err)
+		// Verify the target channel exists in this guild
+		if !b.isTargetChannelInGuild(guild.ID) {
 			continue
 		}
 
-		// Make sure the channel is in this guild
-		if targetChannel.GuildID != guild.ID {
-			log.Printf("Target channel is not in guild %s, skipping", guild.Name)
-			continue
-		}
-
-		log.Printf("Found target D&D voice channel: %s in guild %s", targetChannel.Name, guild.Name)
-
-		// Method 1: Check the session state first (most reliable for cached data)
-		log.Printf("Checking session state for voice states...")
-		for _, vs := range guild.VoiceStates {
-			if vs.UserID == b.config.DMUserID {
-				log.Printf("Found DM in voice channel: %s (from session state)", vs.ChannelID)
-				if vs.ChannelID == b.config.DNDVoiceChannelID {
-					log.Printf("DM is already in the target D&D voice channel! Auto-joining...")
-					b.joinVoiceChannel(guild.ID, vs.ChannelID)
-					return
-				} else {
-					log.Printf("DM is in a different voice channel (ID: %s), not auto-joining", vs.ChannelID)
-					return
-				}
-			}
-		}
-
-		// Method 2: If not found in session state, try to get fresh voice states from the channel itself
-		log.Printf("DM not found in session state, checking channel members...")
-
-		// Get the target channel and verify it exists
-		_, err = b.session.Channel(b.config.DNDVoiceChannelID)
-		if err != nil {
-			log.Printf("Error fetching fresh channel data: %v", err)
-			continue
-		}
-
-		// For voice channels, we need to iterate through guild members and check their voice state
-		// Since the Guild() API doesn't populate voice states, we'll use a different approach
-		log.Printf("Attempting to fetch guild members to check voice states...")
-
-		// Try to get guild members (this might be limited by intents)
-		members, err := b.session.GuildMembers(guild.ID, "", 1000)
-		if err != nil {
-			log.Printf("Could not fetch guild members (this might be due to missing intents): %v", err)
-			log.Printf("Falling back to checking if user is in target channel using different method...")
-
-			// Method 3: Try a more direct approach - attempt to get the specific user
-			member, err := b.session.GuildMember(guild.ID, b.config.DMUserID)
-			if err != nil {
-				log.Printf("Could not fetch DM member from guild: %v", err)
-				continue
-			}
-
-			log.Printf("Successfully fetched DM member: %s", member.User.Username)
-			// Unfortunately, Member objects don't contain voice state either
-			// We'll have to rely on the session state or voice state updates
-			log.Printf("Member object doesn't contain voice state, will rely on voice state updates")
-			continue
-		}
-
-		log.Printf("Successfully fetched %d members from guild", len(members))
-
-		// Check each member for the DM
-		for _, member := range members {
-			if member.User.ID == b.config.DMUserID {
-				log.Printf("Found DM member: %s", member.User.Username)
-				// Note: Member objects don't contain voice state information
-				// Voice states are separate and not included in member data
-				break
-			}
+		// Check if DM is in target voice channel
+		if b.isDMInTargetChannel(guild) {
+			log.Printf("DM is already in the target D&D voice channel! Auto-joining...")
+			b.joinVoiceChannel(guild.ID, b.config.DNDVoiceChannelID)
+			return
 		}
 	}
 
-	log.Printf("DM is not currently in the target D&D channel or voice state not available in cache")
+	log.Printf("DM is not currently in the target D&D channel")
 	log.Printf("Bot will monitor for voice state changes and auto-join when DM joins the target channel")
+}
+
+// isTargetChannelInGuild checks if the target voice channel exists in the given guild
+func (b *Bot) isTargetChannelInGuild(guildID string) bool {
+	targetChannel, err := b.session.Channel(b.config.DNDVoiceChannelID)
+	if err != nil {
+		if b.config.Debug {
+			log.Printf("Could not fetch target channel %s: %v", b.config.DNDVoiceChannelID, err)
+		}
+		return false
+	}
+
+	if targetChannel.GuildID != guildID {
+		if b.config.Debug {
+			log.Printf("Target channel is not in this guild, skipping")
+		}
+		return false
+	}
+
+	if b.config.Debug {
+		log.Printf("Found target D&D voice channel: %s", targetChannel.Name)
+	}
+	return true
+}
+
+// isDMInTargetChannel checks if the DM is currently in the target voice channel
+func (b *Bot) isDMInTargetChannel(guild *discordgo.Guild) bool {
+	for _, vs := range guild.VoiceStates {
+		if vs.UserID == b.config.DMUserID {
+			if b.config.Debug {
+				log.Printf("Found DM in voice channel: %s", vs.ChannelID)
+			}
+			return vs.ChannelID == b.config.DNDVoiceChannelID
+		}
+	}
+	return false
 }
 
 // joinVoiceChannel joins a voice channel and starts audio processing
 func (b *Bot) joinVoiceChannel(guildID, channelID string) {
+	log.Printf("Attempting to join voice channel %s in guild %s", channelID, guildID)
+
 	// Join the voice channel
 	vc, err := b.session.ChannelVoiceJoin(guildID, channelID, false, true)
 	if err != nil {
@@ -321,23 +308,31 @@ func (b *Bot) joinVoiceChannel(guildID, channelID string) {
 	// Start audio processing
 	if err := b.audioProcessor.StartProcessing(vc); err != nil {
 		log.Printf("Error starting audio processing: %v", err)
+		// Still consider the join successful even if audio processing fails
 		return
 	}
 
 	log.Printf("Started audio processing")
 }
 
-// leaveVoiceChannel leaves the current voice channel
+// leaveVoiceChannel leaves the current voice channel in the specified guild
 func (b *Bot) leaveVoiceChannel(guildID string) {
-	// Stop audio processing
+	log.Printf("Attempting to leave voice channel in guild %s", guildID)
+
+	// Stop audio processing first
 	b.audioProcessor.StopProcessing()
 
-	// Leave voice channel
+	// Find and disconnect from the voice channel in this guild
 	for _, vc := range b.session.VoiceConnections {
 		if vc.GuildID == guildID {
-			vc.Disconnect()
-			log.Printf("Left voice channel")
+			if err := vc.Disconnect(); err != nil {
+				log.Printf("Error disconnecting from voice channel: %v", err)
+			} else {
+				log.Printf("Successfully left voice channel")
+			}
 			return
 		}
 	}
+
+	log.Printf("No voice connection found for guild %s", guildID)
 }
