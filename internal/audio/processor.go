@@ -209,12 +209,6 @@ func (p *Processor) processAudioPacket(packet *discordgo.Packet) {
 		return
 	}
 
-	// Log audio reception for debugging
-	if p.debug {
-		log.Printf("[AUDIO] 📦 Packet #%d from SSRC %d: %d bytes",
-			p.packetsReceived, packet.SSRC, len(packet.Opus))
-	}
-
 	// Store the raw opus data for processing
 	p.audioBuffer.Write(packet.Opus)
 	p.totalBytesOpus += int64(len(packet.Opus))
@@ -239,24 +233,13 @@ func (p *Processor) isSilencePacket(packet *discordgo.Packet) bool {
 func (p *Processor) handleSilenceDetection() {
 	p.silenceDetections++
 
-	log.Printf("[AUDIO] 🔇 Silence detection #%d - processing audio segment", p.silenceDetections)
-
 	// Calculate approximate duration (each packet is ~20ms)
 	estimatedPackets := p.audioBuffer.Len() / 100 // Rough bytes per packet
 	estimatedDuration := float32(estimatedPackets) * float32(opusPacketDurationMs) / 1000.0
 
-	if p.debug {
-		log.Printf("[AUDIO] Audio segment contains ~%d packets (%.2f seconds, %d bytes)",
-			estimatedPackets, estimatedDuration, p.audioBuffer.Len())
-	}
-
 	// Process audio if we have sufficient duration
 	if estimatedDuration >= minAudioDurationSeconds {
-		log.Printf("[AUDIO] ✅ Processing audio segment (>%.1fs threshold)", minAudioDurationSeconds)
 		p.processAudioBuffer()
-	} else if p.debug {
-		log.Printf("[AUDIO] ⏭️ Skipping short audio segment (%.2fs < %.1fs threshold)",
-			estimatedDuration, minAudioDurationSeconds)
 	}
 
 	// Reset buffer for next audio segment

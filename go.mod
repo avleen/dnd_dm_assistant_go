@@ -42,3 +42,5 @@ require (
 	google.golang.org/grpc v1.73.0 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
 )
+
+replace github.com/pion/opus => github.com/avleen/opus v0.0.0-20250705204357-4eb3b46b716c
