@@ -18,12 +18,14 @@ import (
 // New creates a new audio processor
 func New(debug bool, speechService *speech.Service) *Processor {
 	processor := &Processor{
-		debug:          debug,
-		speechService:  speechService,
-		isProcessing:   false,
-		oggFiles:       make(map[uint32]*oggwriter.OggWriter),
-		oggBuffers:     make(map[uint32]*bytes.Buffer),
-		lastPacketTime: make(map[uint32]time.Time),
+		debug:              debug,
+		speechService:      speechService,
+		isProcessing:       false,
+		oggFiles:           make(map[uint32]*oggwriter.OggWriter),
+		audioBuffers:       make(map[uint32][]*rtp.Packet),
+		transcriptionChans: make(map[uint32]chan []*rtp.Packet),
+		oggFilePaths:       make(map[uint32]string),
+		lastPacketTime:     make(map[uint32]time.Time),
 		// Initialize debug counters
 		packetsReceived:   0,
 		silenceDetections: 0,
@@ -70,11 +72,17 @@ type Processor struct {
 	// Voice connection
 	voiceConnection *discordgo.VoiceConnection
 
-	// OGG files for each user (keyed by SSRC)
+	// OGG files for each user (keyed by SSRC) - persistent storage
 	oggFiles map[uint32]*oggwriter.OggWriter
 
-	// OGG buffers for each user (keyed by SSRC)
-	oggBuffers map[uint32]*bytes.Buffer
+	// Raw audio packet buffers for each SSRC (for transcription)
+	audioBuffers map[uint32][]*rtp.Packet
+
+	// Channels for sending audio to transcription goroutines
+	transcriptionChans map[uint32]chan []*rtp.Packet
+
+	// File paths for each SSRC's OGG file
+	oggFilePaths map[uint32]string
 
 	// Last packet time for each user (keyed by SSRC) - for silence detection
 	lastPacketTime map[uint32]time.Time
@@ -113,7 +121,9 @@ func (p *Processor) StartProcessing(vc *discordgo.VoiceConnection) error {
 
 	// Initialize maps
 	p.oggFiles = make(map[uint32]*oggwriter.OggWriter)
-	p.oggBuffers = make(map[uint32]*bytes.Buffer)
+	p.audioBuffers = make(map[uint32][]*rtp.Packet)
+	p.transcriptionChans = make(map[uint32]chan []*rtp.Packet)
+	p.oggFilePaths = make(map[uint32]string)
 	p.lastPacketTime = make(map[uint32]time.Time)
 
 	log.Printf("[AUDIO] ✅ Starting audio capture with OGG files per user")
@@ -146,12 +156,12 @@ func (p *Processor) StopProcessing() {
 
 	// Send any remaining buffered audio to Google before closing
 	if p.speechService != nil {
-		for ssrc := range p.oggBuffers {
-			p.sendBufferToGoogle(ssrc)
+		for ssrc := range p.audioBuffers {
+			p.flushAudioBuffer(ssrc)
 		}
 	}
 
-	// Close all OGG files
+	// Close all OGG files and buffer writers
 	for ssrc, oggFile := range p.oggFiles {
 		if oggFile != nil {
 			err := oggFile.Close()
@@ -162,10 +172,18 @@ func (p *Processor) StopProcessing() {
 			}
 		}
 	}
+	// Close all transcription channels
+	for ssrc, ch := range p.transcriptionChans {
+		close(ch)
+		log.Printf("[AUDIO] 📁 Closed transcription channel for SSRC %d", ssrc)
+	}
+
 	p.oggFiles = make(map[uint32]*oggwriter.OggWriter)
 
 	// Clear other maps
-	p.oggBuffers = make(map[uint32]*bytes.Buffer)
+	p.audioBuffers = make(map[uint32][]*rtp.Packet)
+	p.transcriptionChans = make(map[uint32]chan []*rtp.Packet)
+	p.oggFilePaths = make(map[uint32]string)
 	p.lastPacketTime = make(map[uint32]time.Time)
 
 	log.Printf("[AUDIO] ⏹️ Stopped audio processing")
@@ -192,25 +210,32 @@ func (p *Processor) processAudioPacket(packet *discordgo.Packet) {
 		// Skip saving silence packets to OGG files
 		return
 	}
-
 	// Get or create OGG writer for this SSRC (user)
 	oggFile, exists := p.oggFiles[packet.SSRC]
-	var oggBuffer *bytes.Buffer
 
 	if !exists {
 		var err error
-		// Create a buffer to hold OGG data in memory
-		oggBuffer = &bytes.Buffer{}
-		oggFile, err = oggwriter.NewWith(oggBuffer, discordSampleRate, discordChannels)
+
+		// Create filename for this SSRC
+		timestamp := time.Now().Format("20060102_150405")
+		filename := fmt.Sprintf("audio_%s_%d.ogg", timestamp, packet.SSRC)
+
+		// Create OGG writer for persistent file
+		oggFile, err = oggwriter.New(filename, discordSampleRate, discordChannels)
 		if err != nil {
-			log.Printf("[AUDIO] ⚠️ Failed to create OGG buffer for SSRC %d: %v", packet.SSRC, err)
+			log.Printf("[AUDIO] ⚠️ Failed to create OGG file for SSRC %d: %v", packet.SSRC, err)
 			return
 		}
+
 		p.oggFiles[packet.SSRC] = oggFile
-		p.oggBuffers[packet.SSRC] = oggBuffer
-		log.Printf("[AUDIO] 📁 Created OGG buffer for SSRC %d", packet.SSRC)
-	} else {
-		// Buffer already exists, no need to get reference
+		p.oggFilePaths[packet.SSRC] = filename
+		p.audioBuffers[packet.SSRC] = make([]*rtp.Packet, 0)
+
+		// Create transcription channel and start goroutine
+		p.transcriptionChans[packet.SSRC] = make(chan []*rtp.Packet, 10)
+		go p.transcriptionWorker(packet.SSRC, p.transcriptionChans[packet.SSRC])
+
+		log.Printf("[AUDIO] 📁 Created OGG file %s for SSRC %d", filename, packet.SSRC)
 	}
 
 	// Update last packet time for this SSRC
@@ -230,8 +255,7 @@ func (p *Processor) processAudioPacket(packet *discordgo.Packet) {
 		},
 		Payload: packet.Opus,
 	}
-
-	// Write RTP packet to OGG file
+	// Write RTP packet to persistent OGG file
 	err := oggFile.WriteRTP(rtpPacket)
 	if err != nil {
 		log.Printf("[AUDIO] ⚠️ Failed to write RTP packet to OGG file for SSRC %d: %v", packet.SSRC, err)
@@ -239,13 +263,8 @@ func (p *Processor) processAudioPacket(packet *discordgo.Packet) {
 		p.totalBytesWritten += int64(len(packet.Opus))
 	}
 
-	// Log packet info
-	if p.debug {
-		if p.packetsReceived%20 == 0 { // Log every 20 audio packets
-			log.Printf("[AUDIO] 📤 Audio packet #%d from SSRC %d (%d bytes)",
-				p.packetsReceived, packet.SSRC, len(packet.Opus))
-		}
-	}
+	// Add packet to buffer for transcription
+	p.audioBuffers[packet.SSRC] = append(p.audioBuffers[packet.SSRC], rtpPacket)
 
 	// Every 50 packets (1 second), log status
 	if p.debug && p.packetsReceived%50 == 0 {
@@ -289,46 +308,35 @@ func (p *Processor) writeDebugFile(ssrc uint32, data []byte) {
 	}
 }
 
-// sendBufferToGoogle sends the accumulated OGG buffer to Google for transcription
-func (p *Processor) sendBufferToGoogle(ssrc uint32) {
+// flushAudioBuffer sends the accumulated audio packets to transcription worker
+func (p *Processor) flushAudioBuffer(ssrc uint32) {
 	if p.speechService == nil {
 		return
 	}
 
-	buffer, exists := p.oggBuffers[ssrc]
-	if !exists || buffer.Len() == 0 {
+	buffer, exists := p.audioBuffers[ssrc]
+	if !exists || len(buffer) == 0 {
 		return
 	}
 
-	// Send the buffered OGG data to Google using REST API
-	result, err := p.speechService.RecognizeAudio(buffer.Bytes())
-	if err != nil {
+	// Send copy of buffer to transcription worker
+	packetsCopy := make([]*rtp.Packet, len(buffer))
+	copy(packetsCopy, buffer)
+
+	// Send to transcription channel (non-blocking)
+	select {
+	case p.transcriptionChans[ssrc] <- packetsCopy:
 		if p.debug {
-			log.Printf("[AUDIO] ⚠️ Failed to send buffered audio to Google for SSRC %d: %v", ssrc, err)
+			log.Printf("[AUDIO] 🔍 Sent %d packets to transcription worker for SSRC %d", len(packetsCopy), ssrc)
 		}
-
-		// Write the failed buffer to disk for manual testing
-		p.writeDebugFile(ssrc, buffer.Bytes())
-	} else {
+	default:
 		if p.debug {
-			log.Printf("[AUDIO] � Sent %d bytes of buffered OGG audio to Google for SSRC %d", buffer.Len(), ssrc)
-		}
-
-		// Print the transcription result to stdout
-		if result != nil {
-			fmt.Printf("[TRANSCRIPTION] SSRC %d [FINAL]: %s (confidence: %.2f)\n",
-				ssrc, result.Transcript, result.Confidence)
-
-			// Also log to internal logging if debug is enabled
-			if p.debug {
-				log.Printf("[AUDIO] 📝 Transcription for SSRC %d [FINAL]: %s (confidence: %.2f)",
-					ssrc, result.Transcript, result.Confidence)
-			}
+			log.Printf("[AUDIO] ⚠️ Transcription channel full for SSRC %d, dropping buffer", ssrc)
 		}
 	}
 
-	// Flush the buffer after sending
-	buffer.Reset()
+	// Clear the buffer
+	p.audioBuffers[ssrc] = p.audioBuffers[ssrc][:0]
 
 	// Update last packet time to prevent immediate re-sending
 	p.lastPacketTime[ssrc] = time.Now()
@@ -390,12 +398,67 @@ func (p *Processor) checkAllForSilence() {
 	for ssrc, lastTime := range p.lastPacketTime {
 		if now.Sub(lastTime) > silenceThreshold {
 			// Check if this SSRC has buffered audio to send
-			if buffer, exists := p.oggBuffers[ssrc]; exists && buffer.Len() > 0 {
+			if buffer, exists := p.audioBuffers[ssrc]; exists && len(buffer) > 0 {
 				if p.debug {
-					log.Printf("[AUDIO] 🔍 Detected silence for SSRC %d (%.2fs), sending %d bytes to Google",
-						ssrc, now.Sub(lastTime).Seconds(), buffer.Len())
+					log.Printf("[AUDIO] 🔍 Detected silence for SSRC %d (%.2fs), sending %d packets to transcription",
+						ssrc, now.Sub(lastTime).Seconds(), len(buffer))
 				}
-				p.sendBufferToGoogle(ssrc)
+				p.flushAudioBuffer(ssrc)
+			}
+		}
+	}
+}
+
+// transcriptionWorker processes audio packets for transcription in a separate goroutine
+func (p *Processor) transcriptionWorker(ssrc uint32, packets chan []*rtp.Packet) {
+	for packetBatch := range packets {
+		if !p.isProcessing {
+			return
+		}
+
+		// Create a new OGG buffer with headers for each batch
+		buffer := &bytes.Buffer{}
+		oggWriter, err := oggwriter.NewWith(buffer, discordSampleRate, discordChannels)
+		if err != nil {
+			if p.debug {
+				log.Printf("[AUDIO] ⚠️ Failed to create transcription OGG writer for SSRC %d: %v", ssrc, err)
+			}
+			continue
+		}
+
+		// Write all packets to the fresh OGG buffer
+		for _, packet := range packetBatch {
+			err := oggWriter.WriteRTP(packet)
+			if err != nil {
+				if p.debug {
+					log.Printf("[AUDIO] ⚠️ Failed to write packet to transcription buffer for SSRC %d: %v", ssrc, err)
+				}
+			}
+		}
+
+		// Close the OGG writer to finalize the stream
+		oggWriter.Close()
+
+		// Send to Google for transcription
+		result, err := p.speechService.RecognizeAudio(buffer.Bytes())
+		if err != nil {
+			if p.debug {
+				log.Printf("[AUDIO] ⚠️ Failed to transcribe audio for SSRC %d: %v", ssrc, err)
+			}
+
+			// Write the failed buffer to disk for manual testing
+			p.writeDebugFile(ssrc, buffer.Bytes())
+		} else {
+			// Print the transcription result to stdout
+			if result != nil {
+				fmt.Printf("[TRANSCRIPTION] SSRC %d [FINAL]: %s (confidence: %.2f)\n",
+					ssrc, result.Transcript, result.Confidence)
+
+				// Also log to internal logging if debug is enabled
+				if p.debug {
+					log.Printf("[AUDIO] 📝 Transcription for SSRC %d [FINAL]: %s (confidence: %.2f)",
+						ssrc, result.Transcript, result.Confidence)
+				}
 			}
 		}
 	}
