@@ -87,6 +87,9 @@ type Processor struct {
 	// Last packet time for each user (keyed by SSRC) - for silence detection
 	lastPacketTime map[uint32]time.Time
 
+	// Callback for transcription results
+	transcriptionCallback func(ssrc uint32, text string, confidence float64)
+
 	// Debug counters
 	packetsReceived   int64
 	silenceDetections int64
@@ -459,7 +462,23 @@ func (p *Processor) transcriptionWorker(ssrc uint32, packets chan []*rtp.Packet)
 					log.Printf("[AUDIO] 📝 Transcription for SSRC %d [FINAL]: %s (confidence: %.2f)",
 						ssrc, result.Transcript, result.Confidence)
 				}
+
+				// Call transcription callback if set
+				p.mutex.RLock()
+				callback := p.transcriptionCallback
+				p.mutex.RUnlock()
+				
+				if callback != nil {
+					callback(ssrc, result.Transcript, float64(result.Confidence))
+				}
 			}
 		}
 	}
+}
+
+// SetTranscriptionCallback sets the callback function for transcription results
+func (p *Processor) SetTranscriptionCallback(callback func(ssrc uint32, text string, confidence float64)) {
+	p.mutex.Lock()
+	defer p.mutex.Unlock()
+	p.transcriptionCallback = callback
 }

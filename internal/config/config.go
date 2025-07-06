@@ -22,6 +22,11 @@ type Config struct {
 	// Google Cloud Speech-to-Text
 	GoogleProjectID string
 	GoogleCredsPath string
+
+	// Anthropic Claude
+	AnthropicAPIKey     string
+	ConversationFile    string
+	MaxConversationMsgs int
 }
 
 const (
@@ -79,6 +84,11 @@ func Load() (*Config, error) {
 		// Google Cloud Speech-to-Text
 		GoogleProjectID: os.Getenv("GOOGLE_PROJECT_ID"),
 		GoogleCredsPath: os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
+
+		// Anthropic Claude
+		AnthropicAPIKey:     os.Getenv("ANTHROPIC_API_KEY"),
+		ConversationFile:    getEnvWithDefault("CONVERSATION_FILE", "dnd_conversation.json"),
+		MaxConversationMsgs: getEnvWithDefaultInt("MAX_CONVERSATION_MSGS", 200),
 	}
 
 	// Validate configuration
@@ -120,6 +130,16 @@ func (c *Config) validate() error {
 func getEnvWithDefault(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
 		return value
+	}
+	return defaultValue
+}
+
+// getEnvWithDefaultInt returns environment variable value as int or default if not set/invalid
+func getEnvWithDefaultInt(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if parsed, err := strconv.Atoi(value); err == nil {
+			return parsed
+		}
 	}
 	return defaultValue
 }

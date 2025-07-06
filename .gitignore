@@ -1,6 +1,10 @@
 # Environment files
 .env
 
+# Claude conversation history
+dnd_conversation.json
+*.conversation.json
+
 # Go build artifacts
 *.exe
 *.exe~

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"dnd_dm_assistant_go/internal/audio"
+	"dnd_dm_assistant_go/internal/claude"
 	"dnd_dm_assistant_go/internal/config"
 	"dnd_dm_assistant_go/internal/speech"
 
@@ -22,14 +23,18 @@ const (
 	commandLeave  = "leave"
 	commandStatus = "status"
 	commandHelp   = "help"
+	commandAsk    = "ask"
+	commandFlush  = "flush"
+	commandClear  = "clear"
 )
 
 // Bot represents the D&D DM Assistant Discord bot
 type Bot struct {
-	config         *config.Config
-	session        *discordgo.Session
-	audioProcessor *audio.Processor
-	speechService  *speech.Service
+	config               *config.Config
+	session              *discordgo.Session
+	audioProcessor       *audio.Processor
+	speechService        *speech.Service
+	conversationManager  *claude.ConversationManager
 }
 
 // New creates a new Bot instance
@@ -81,11 +86,40 @@ func New(cfg *config.Config) (*Bot, error) {
 	// Create audio processor
 	audioProcessor := audio.New(cfg.Debug, speechService)
 
+	// Create Claude conversation manager if API key is available
+	var conversationManager *claude.ConversationManager
+	if cfg.AnthropicAPIKey != "" {
+		log.Printf("🔧 Attempting to create Claude conversation manager")
+		
+		claudeService := claude.NewService(cfg.AnthropicAPIKey, cfg.Debug)
+		conversationManager = claude.NewConversationManager(
+			claudeService,
+			cfg.ConversationFile,
+			cfg.MaxConversationMsgs,
+			cfg.Debug,
+		)
+		
+		log.Printf("✅ Claude conversation manager created successfully")
+		log.Printf("   📝 Conversation file: %s", cfg.ConversationFile)
+		log.Printf("   📊 Max messages: %d", cfg.MaxConversationMsgs)
+	} else {
+		log.Printf("ℹ️  Anthropic API key not configured - Claude assistant disabled")
+		log.Printf("   Set ANTHROPIC_API_KEY environment variable to enable Claude assistant")
+	}
+
 	bot := &Bot{
-		config:         cfg,
-		session:        session,
-		audioProcessor: audioProcessor,
-		speechService:  speechService,
+		config:              cfg,
+		session:             session,
+		audioProcessor:      audioProcessor,
+		speechService:       speechService,
+		conversationManager: conversationManager,
+	}
+
+	// Set up transcription callback to send transcriptions to Claude
+	if conversationManager != nil {
+		audioProcessor.SetTranscriptionCallback(func(ssrc uint32, text string, confidence float64) {
+			conversationManager.AddTranscription(ssrc, text)
+		})
 	}
 
 	// Set up event handlers
@@ -222,6 +256,12 @@ func (b *Bot) handleCommand(s *discordgo.Session, m *discordgo.MessageCreate) {
 		b.handleStatusCommand(s, m)
 	case commandHelp:
 		b.handleHelpCommand(s, m)
+	case commandAsk:
+		b.handleAskCommand(s, m, args[1:])
+	case commandFlush:
+		b.handleFlushCommand(s, m)
+	case commandClear:
+		b.handleClearCommand(s, m)
 	}
 }
 
@@ -266,9 +306,16 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, m *discordgo.MessageCrea
 	}
 
 	if b.speechService != nil {
-		status += "🗣️ Speech-to-text service: ✅ Active"
+		status += "🗣️ Speech-to-text service: ✅ Active\n"
 	} else {
-		status += "🗣️ Speech-to-text service: ❌ Disabled"
+		status += "🗣️ Speech-to-text service: ❌ Disabled\n"
+	}
+
+	if b.conversationManager != nil {
+		status += "🤖 Claude assistant: ✅ Active\n"
+		status += fmt.Sprintf("💬 %s", b.conversationManager.GetConversationSummary())
+	} else {
+		status += "🤖 Claude assistant: ❌ Disabled"
 	}
 
 	s.ChannelMessageSend(m.ChannelID, status)
@@ -277,12 +324,26 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, m *discordgo.MessageCrea
 // handleHelpCommand handles the help command
 func (b *Bot) handleHelpCommand(s *discordgo.Session, m *discordgo.MessageCreate) {
 	help := "**D&D DM Assistant Bot Commands**\n\n"
+	help += "**Voice Channel Commands:**\n"
 	help += fmt.Sprintf("`%s %s` - Join your current voice channel\n", b.config.CommandPrefix, commandJoin)
 	help += fmt.Sprintf("`%s %s` - Leave the current voice channel\n", b.config.CommandPrefix, commandLeave)
 	help += fmt.Sprintf("`%s %s` - Show bot status\n", b.config.CommandPrefix, commandStatus)
-	help += fmt.Sprintf("`%s %s` - Show this help message\n", b.config.CommandPrefix, commandHelp)
+	
+	if b.conversationManager != nil {
+		help += "\n**Claude Assistant Commands:**\n"
+		help += fmt.Sprintf("`%s %s <question>` - Ask Claude a question\n", b.config.CommandPrefix, commandAsk)
+		help += fmt.Sprintf("`%s %s` - Send buffered transcriptions to Claude\n", b.config.CommandPrefix, commandFlush)
+		help += fmt.Sprintf("`%s %s` - Clear conversation history\n", b.config.CommandPrefix, commandClear)
+	}
+	
+	help += fmt.Sprintf("\n`%s %s` - Show this help message\n", b.config.CommandPrefix, commandHelp)
 	help += "\n**Automatic Features:**\n"
 	help += fmt.Sprintf("- Bot automatically joins when <@%s> joins <#%s>\n", b.config.DMUserID, b.config.DNDVoiceChannelID)
+	help += "- Voice transcriptions are automatically captured when in voice channel"
+	
+	if b.conversationManager != nil {
+		help += "\n- Transcriptions are buffered for Claude context"
+	}
 
 	s.ChannelMessageSend(m.ChannelID, help)
 }
@@ -400,4 +461,104 @@ func (b *Bot) leaveVoiceChannel(guildID string) {
 	}
 
 	log.Printf("No voice connection found for guild %s", guildID)
+}
+
+// handleAskCommand handles the ask command for Claude
+func (b *Bot) handleAskCommand(s *discordgo.Session, m *discordgo.MessageCreate, args []string) {
+	if b.conversationManager == nil {
+		s.ChannelMessageSend(m.ChannelID, "❌ Claude assistant is not available. Please set ANTHROPIC_API_KEY.")
+		return
+	}
+
+	if len(args) == 0 {
+		s.ChannelMessageSend(m.ChannelID, "❌ Please provide a question. Usage: `!dnd ask <your question>`")
+		return
+	}
+
+	question := strings.Join(args, " ")
+	
+	// Send typing indicator
+	s.ChannelTyping(m.ChannelID)
+
+	response, err := b.conversationManager.AskQuestion(question)
+	if err != nil {
+		log.Printf("Error getting response from Claude: %v", err)
+		s.ChannelMessageSend(m.ChannelID, "❌ Failed to get response from Claude. Please try again.")
+		return
+	}
+
+	// Format the response with Claude prefix
+	formattedResponse := fmt.Sprintf("[CLAUDE] %s", response)
+	
+	// Discord has a 2000 character limit, so split long responses
+	if len(formattedResponse) > 2000 {
+		chunks := splitMessage(formattedResponse, 2000)
+		for _, chunk := range chunks {
+			s.ChannelMessageSend(m.ChannelID, chunk)
+		}
+	} else {
+		s.ChannelMessageSend(m.ChannelID, formattedResponse)
+	}
+}
+
+// handleFlushCommand handles the flush command to send transcriptions to Claude
+func (b *Bot) handleFlushCommand(s *discordgo.Session, m *discordgo.MessageCreate) {
+	if b.conversationManager == nil {
+		s.ChannelMessageSend(m.ChannelID, "❌ Claude assistant is not available. Please set ANTHROPIC_API_KEY.")
+		return
+	}
+
+	b.conversationManager.FlushTranscriptions()
+	summary := b.conversationManager.GetConversationSummary()
+	s.ChannelMessageSend(m.ChannelID, fmt.Sprintf("✅ Flushed transcriptions to Claude. %s", summary))
+}
+
+// handleClearCommand handles the clear command to clear conversation history
+func (b *Bot) handleClearCommand(s *discordgo.Session, m *discordgo.MessageCreate) {
+	if b.conversationManager == nil {
+		s.ChannelMessageSend(m.ChannelID, "❌ Claude assistant is not available. Please set ANTHROPIC_API_KEY.")
+		return
+	}
+
+	err := b.conversationManager.ClearConversation()
+	if err != nil {
+		log.Printf("Error clearing conversation: %v", err)
+		s.ChannelMessageSend(m.ChannelID, "❌ Failed to clear conversation history.")
+		return
+	}
+
+	s.ChannelMessageSend(m.ChannelID, "✅ Conversation history cleared.")
+}
+
+// splitMessage splits a message into chunks that fit Discord's character limit
+func splitMessage(message string, maxLength int) []string {
+	if len(message) <= maxLength {
+		return []string{message}
+	}
+
+	var chunks []string
+	for len(message) > maxLength {
+		// Find the last space before the limit
+		splitPos := maxLength
+		for splitPos > 0 && message[splitPos] != ' ' && message[splitPos] != '\n' {
+			splitPos--
+		}
+		
+		if splitPos == 0 {
+			// No good split point found, just cut at the limit
+			splitPos = maxLength
+		}
+
+		chunks = append(chunks, message[:splitPos])
+		message = message[splitPos:]
+		
+		// Remove leading whitespace from the next chunk
+		message = strings.TrimLeft(message, " \n")
+	}
+
+	if len(message) > 0 {
+		chunks = append(chunks, message)
+	}
+
+	return chunks
 }
