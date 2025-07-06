@@ -22,7 +22,7 @@ type Service struct {
 // NewService creates a new speech service
 func NewService(projectID string, debug bool) (*Service, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	client, err := speech.NewClient(ctx)
 	if err != nil {
 		cancel()
@@ -64,7 +64,7 @@ func (s *Service) createStreamingConfig() *speechpb.StreamingRecognitionConfig {
 // StartStreaming creates a new streaming recognition session
 func (s *Service) StartStreaming() (*StreamingSession, error) {
 	recognizer := fmt.Sprintf("projects/%s/locations/global/recognizers/_", s.projectID)
-	
+
 	stream, err := s.client.StreamingRecognize(s.ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create streaming recognize: %w", err)
@@ -73,7 +73,7 @@ func (s *Service) StartStreaming() (*StreamingSession, error) {
 	// Send the initial configuration
 	config := s.createStreamingConfig()
 	configRequest := &speechpb.StreamingRecognizeRequest{
-		Recognizer:           recognizer,
+		Recognizer: recognizer,
 		StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
 			StreamingConfig: config,
 		},
@@ -109,12 +109,12 @@ type StreamingSession struct {
 
 // TranscriptionResult contains the transcription results
 type TranscriptionResult struct {
-	Transcript   string
-	Confidence   float32
-	IsFinal      bool
-	Speaker      int32
-	WordDetails  []*speechpb.WordInfo
-	Language     string
+	Transcript  string
+	Confidence  float32
+	IsFinal     bool
+	Speaker     int32
+	WordDetails []*speechpb.WordInfo
+	Language    string
 }
 
 // SendAudio sends PCM audio data to the streaming session
@@ -153,7 +153,7 @@ func (s *StreamingSession) listen() {
 			for _, result := range response.Results {
 				if len(result.Alternatives) > 0 {
 					alt := result.Alternatives[0]
-					
+
 					transcriptionResult := &TranscriptionResult{
 						Transcript:  alt.Transcript,
 						Confidence:  alt.Confidence,
@@ -178,7 +178,7 @@ func (s *StreamingSession) listen() {
 							if transcriptionResult.IsFinal {
 								finalText = " [FINAL]"
 							}
-							log.Printf("Speech result%s: %s (confidence: %.2f)", 
+							log.Printf("Speech result%s: %s (confidence: %.2f)",
 								finalText, transcriptionResult.Transcript, transcriptionResult.Confidence)
 						}
 					default:
