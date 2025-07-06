@@ -24,11 +24,17 @@ type Service struct {
 	debug  bool
 }
 
-// Message represents a single message in the conversation
+// Message represents a single message in the conversation (with timestamp for internal use)
 type Message struct {
 	Role      string      `json:"role"`      // "user", "assistant", or "system"
 	Content   interface{} `json:"content"`   // string or []ContentBlock
 	Timestamp time.Time   `json:"timestamp"` // When this message was created
+}
+
+// APIMessage represents a message for the Claude API (without timestamp)
+type APIMessage struct {
+	Role    string      `json:"role"`    // "user", "assistant", or "system"
+	Content interface{} `json:"content"` // string or []ContentBlock
 }
 
 // ContentBlock represents a content block (text, image, etc.)
@@ -37,7 +43,15 @@ type ContentBlock struct {
 	Text string `json:"text"`
 }
 
-// Request represents a request to the Claude API
+// APIRequest represents a request to the Claude API
+type APIRequest struct {
+	Model     string       `json:"model"`
+	Messages  []APIMessage `json:"messages"`
+	MaxTokens int          `json:"max_tokens"`
+	System    string       `json:"system,omitempty"`
+}
+
+// Request represents a request to the Claude API (deprecated, kept for compatibility)
 type Request struct {
 	Model     string    `json:"model"`
 	Messages  []Message `json:"messages"`
@@ -89,10 +103,19 @@ func (s *Service) SendMessage(messages []Message, systemPrompt string) (*Respons
 		log.Printf("[CLAUDE] Sending %d messages to Claude API", len(messages))
 	}
 
+	// Create API-compatible messages (without timestamp field)
+	apiMessages := make([]APIMessage, len(messages))
+	for i, msg := range messages {
+		apiMessages[i] = APIMessage{
+			Role:    msg.Role,
+			Content: msg.Content,
+		}
+	}
+
 	// Prepare the request
-	request := Request{
+	request := APIRequest{
 		Model:     defaultModel,
-		Messages:  messages,
+		Messages:  apiMessages,
 		MaxTokens: maxTokens,
 		System:    systemPrompt,
 	}

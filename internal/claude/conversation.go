@@ -47,7 +47,7 @@ Guidelines:
 - If you're uncertain about a rule, say so and suggest where to look it up
 - Don't make decisions for the DM - offer options and suggestions
 - Pay attention to the ongoing conversation context
-- Use "[CLAUDE]" prefix for your responses to distinguish them
+- The DM or others may ask you questions directly by addressing you as CLAUDE, so be ready to respond
 
 The conversation below represents the ongoing D&D session. Recent transcriptions will show as "[TRANSCRIPTION] SSRC <number>: <text>" where each SSRC represents a different speaker.`
 )
@@ -207,6 +207,13 @@ func (cm *ConversationManager) ClearConversation() error {
 	}
 
 	return nil
+}
+
+// HasPendingTranscriptions returns true if there are transcriptions waiting to be flushed
+func (cm *ConversationManager) HasPendingTranscriptions() bool {
+	cm.mutex.RLock()
+	defer cm.mutex.RUnlock()
+	return len(cm.transcriptionBuf) > 0
 }
 
 // trimMessages removes old messages if we exceed the maximum

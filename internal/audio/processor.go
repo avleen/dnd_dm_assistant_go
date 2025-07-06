@@ -467,7 +467,7 @@ func (p *Processor) transcriptionWorker(ssrc uint32, packets chan []*rtp.Packet)
 				p.mutex.RLock()
 				callback := p.transcriptionCallback
 				p.mutex.RUnlock()
-				
+
 				if callback != nil {
 					callback(ssrc, result.Transcript, float64(result.Confidence))
 				}

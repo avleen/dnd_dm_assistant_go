@@ -30,11 +30,12 @@ const (
 
 // Bot represents the D&D DM Assistant Discord bot
 type Bot struct {
-	config               *config.Config
-	session              *discordgo.Session
-	audioProcessor       *audio.Processor
-	speechService        *speech.Service
-	conversationManager  *claude.ConversationManager
+	config              *config.Config
+	session             *discordgo.Session
+	audioProcessor      *audio.Processor
+	speechService       *speech.Service
+	conversationManager *claude.ConversationManager
+	stopAutoFlush       chan bool
 }
 
 // New creates a new Bot instance
@@ -90,7 +91,7 @@ func New(cfg *config.Config) (*Bot, error) {
 	var conversationManager *claude.ConversationManager
 	if cfg.AnthropicAPIKey != "" {
 		log.Printf("🔧 Attempting to create Claude conversation manager")
-		
+
 		claudeService := claude.NewService(cfg.AnthropicAPIKey, cfg.Debug)
 		conversationManager = claude.NewConversationManager(
 			claudeService,
@@ -98,7 +99,7 @@ func New(cfg *config.Config) (*Bot, error) {
 			cfg.MaxConversationMsgs,
 			cfg.Debug,
 		)
-		
+
 		log.Printf("✅ Claude conversation manager created successfully")
 		log.Printf("   📝 Conversation file: %s", cfg.ConversationFile)
 		log.Printf("   📊 Max messages: %d", cfg.MaxConversationMsgs)
@@ -113,6 +114,7 @@ func New(cfg *config.Config) (*Bot, error) {
 		audioProcessor:      audioProcessor,
 		speechService:       speechService,
 		conversationManager: conversationManager,
+		stopAutoFlush:       make(chan bool),
 	}
 
 	// Set up transcription callback to send transcriptions to Claude
@@ -120,6 +122,9 @@ func New(cfg *config.Config) (*Bot, error) {
 		audioProcessor.SetTranscriptionCallback(func(ssrc uint32, text string, confidence float64) {
 			conversationManager.AddTranscription(ssrc, text)
 		})
+		
+		// Start auto-flush background process
+		go bot.autoFlushTranscriptions()
 	}
 
 	// Set up event handlers
@@ -145,6 +150,18 @@ func (b *Bot) Start() error {
 // Stop stops the bot gracefully
 func (b *Bot) Stop() {
 	log.Printf("Shutting down bot gracefully...")
+
+	// Stop auto-flush background process
+	if b.conversationManager != nil {
+		select {
+		case b.stopAutoFlush <- true:
+			if b.config.Debug {
+				log.Printf("Sent stop signal to auto-flush process")
+			}
+		default:
+			// Channel might be full or closed, continue shutdown
+		}
+	}
 
 	// Stop audio processing first
 	if b.audioProcessor != nil {
@@ -313,7 +330,12 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, m *discordgo.MessageCrea
 
 	if b.conversationManager != nil {
 		status += "🤖 Claude assistant: ✅ Active\n"
-		status += fmt.Sprintf("💬 %s", b.conversationManager.GetConversationSummary())
+		status += fmt.Sprintf("💬 %s\n", b.conversationManager.GetConversationSummary())
+		if b.conversationManager.HasPendingTranscriptions() {
+			status += "⏱️ Auto-flush: ✅ Running (pending transcriptions)"
+		} else {
+			status += "⏱️ Auto-flush: ✅ Running (no pending transcriptions)"
+		}
 	} else {
 		status += "🤖 Claude assistant: ❌ Disabled"
 	}
@@ -328,21 +350,21 @@ func (b *Bot) handleHelpCommand(s *discordgo.Session, m *discordgo.MessageCreate
 	help += fmt.Sprintf("`%s %s` - Join your current voice channel\n", b.config.CommandPrefix, commandJoin)
 	help += fmt.Sprintf("`%s %s` - Leave the current voice channel\n", b.config.CommandPrefix, commandLeave)
 	help += fmt.Sprintf("`%s %s` - Show bot status\n", b.config.CommandPrefix, commandStatus)
-	
+
 	if b.conversationManager != nil {
 		help += "\n**Claude Assistant Commands:**\n"
 		help += fmt.Sprintf("`%s %s <question>` - Ask Claude a question\n", b.config.CommandPrefix, commandAsk)
 		help += fmt.Sprintf("`%s %s` - Send buffered transcriptions to Claude\n", b.config.CommandPrefix, commandFlush)
 		help += fmt.Sprintf("`%s %s` - Clear conversation history\n", b.config.CommandPrefix, commandClear)
 	}
-	
+
 	help += fmt.Sprintf("\n`%s %s` - Show this help message\n", b.config.CommandPrefix, commandHelp)
 	help += "\n**Automatic Features:**\n"
 	help += fmt.Sprintf("- Bot automatically joins when <@%s> joins <#%s>\n", b.config.DMUserID, b.config.DNDVoiceChannelID)
 	help += "- Voice transcriptions are automatically captured when in voice channel"
-	
+
 	if b.conversationManager != nil {
-		help += "\n- Transcriptions are buffered for Claude context"
+		help += "\n- Transcriptions are buffered and auto-flushed to Claude every 10 seconds"
 	}
 
 	s.ChannelMessageSend(m.ChannelID, help)
@@ -476,7 +498,7 @@ func (b *Bot) handleAskCommand(s *discordgo.Session, m *discordgo.MessageCreate,
 	}
 
 	question := strings.Join(args, " ")
-	
+
 	// Send typing indicator
 	s.ChannelTyping(m.ChannelID)
 
@@ -489,7 +511,7 @@ func (b *Bot) handleAskCommand(s *discordgo.Session, m *discordgo.MessageCreate,
 
 	// Format the response with Claude prefix
 	formattedResponse := fmt.Sprintf("[CLAUDE] %s", response)
-	
+
 	// Discord has a 2000 character limit, so split long responses
 	if len(formattedResponse) > 2000 {
 		chunks := splitMessage(formattedResponse, 2000)
@@ -543,7 +565,7 @@ func splitMessage(message string, maxLength int) []string {
 		for splitPos > 0 && message[splitPos] != ' ' && message[splitPos] != '\n' {
 			splitPos--
 		}
-		
+
 		if splitPos == 0 {
 			// No good split point found, just cut at the limit
 			splitPos = maxLength
@@ -551,7 +573,7 @@ func splitMessage(message string, maxLength int) []string {
 
 		chunks = append(chunks, message[:splitPos])
 		message = message[splitPos:]
-		
+
 		// Remove leading whitespace from the next chunk
 		message = strings.TrimLeft(message, " \n")
 	}
@@ -561,4 +583,32 @@ func splitMessage(message string, maxLength int) []string {
 	}
 
 	return chunks
+}
+
+// autoFlushTranscriptions runs in the background to automatically flush transcriptions every 10 seconds
+func (b *Bot) autoFlushTranscriptions() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	if b.config.Debug {
+		log.Printf("[BOT] Started auto-flush transcriptions background process")
+	}
+
+	for {
+		select {
+		case <-ticker.C:
+			// Check if there are transcriptions to flush
+			if b.conversationManager != nil && b.conversationManager.HasPendingTranscriptions() {
+				if b.config.Debug {
+					log.Printf("[BOT] Auto-flushing transcriptions to Claude")
+				}
+				b.conversationManager.FlushTranscriptions()
+			}
+		case <-b.stopAutoFlush:
+			if b.config.Debug {
+				log.Printf("[BOT] Stopped auto-flush transcriptions background process")
+			}
+			return
+		}
+	}
 }
