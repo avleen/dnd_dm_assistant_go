@@ -122,7 +122,7 @@ func New(cfg *config.Config) (*Bot, error) {
 		audioProcessor.SetTranscriptionCallback(func(ssrc uint32, text string, confidence float64) {
 			conversationManager.AddTranscription(ssrc, text)
 		})
-		
+
 		// Start auto-flush background process
 		go bot.autoFlushTranscriptions()
 	}
@@ -331,6 +331,7 @@ func (b *Bot) handleStatusCommand(s *discordgo.Session, m *discordgo.MessageCrea
 	if b.conversationManager != nil {
 		status += "🤖 Claude assistant: ✅ Active\n"
 		status += fmt.Sprintf("💬 %s\n", b.conversationManager.GetConversationSummary())
+		status += "📤 Auto-responses: DM via private message\n"
 		if b.conversationManager.HasPendingTranscriptions() {
 			status += "⏱️ Auto-flush: ✅ Running (pending transcriptions)"
 		} else {
@@ -365,6 +366,7 @@ func (b *Bot) handleHelpCommand(s *discordgo.Session, m *discordgo.MessageCreate
 
 	if b.conversationManager != nil {
 		help += "\n- Transcriptions are buffered and auto-flushed to Claude every 10 seconds"
+		help += "\n- Claude may respond automatically via DM when it has insights or answers"
 	}
 
 	s.ChannelMessageSend(m.ChannelID, help)
@@ -552,6 +554,37 @@ func (b *Bot) handleClearCommand(s *discordgo.Session, m *discordgo.MessageCreat
 	s.ChannelMessageSend(m.ChannelID, "✅ Conversation history cleared.")
 }
 
+// sendClaudeResponseToDM sends a Claude response as a direct message to the DM
+func (b *Bot) sendClaudeResponseToDM(response string) {
+	if response == "" {
+		return
+	}
+
+	// Create DM channel with the DM user
+	dmChannel, err := b.session.UserChannelCreate(b.config.DMUserID)
+	if err != nil {
+		log.Printf("[BOT] ⚠️ Failed to create DM channel with DM: %v", err)
+		return
+	}
+
+	// Format the response with Claude prefix
+	formattedResponse := fmt.Sprintf("[CLAUDE] %s", response)
+
+	// Discord has a 2000 character limit, so split long responses
+	if len(formattedResponse) > 2000 {
+		chunks := splitMessage(formattedResponse, 2000)
+		for _, chunk := range chunks {
+			if _, err := b.session.ChannelMessageSend(dmChannel.ID, chunk); err != nil {
+				log.Printf("[BOT] ⚠️ Failed to send Claude response chunk to DM: %v", err)
+			}
+		}
+	} else {
+		if _, err := b.session.ChannelMessageSend(dmChannel.ID, formattedResponse); err != nil {
+			log.Printf("[BOT] ⚠️ Failed to send Claude response to DM: %v", err)
+		}
+	}
+}
+
 // splitMessage splits a message into chunks that fit Discord's character limit
 func splitMessage(message string, maxLength int) []string {
 	if len(message) <= maxLength {
@@ -600,9 +633,20 @@ func (b *Bot) autoFlushTranscriptions() {
 			// Check if there are transcriptions to flush
 			if b.conversationManager != nil && b.conversationManager.HasPendingTranscriptions() {
 				if b.config.Debug {
-					log.Printf("[BOT] Auto-flushing transcriptions to Claude")
+					log.Printf("[BOT] Auto-flushing transcriptions to Claude and requesting response")
 				}
-				b.conversationManager.FlushTranscriptions()
+
+				// Flush transcriptions and get Claude's response
+				response, err := b.conversationManager.FlushTranscriptionsAndRespond()
+				if err != nil {
+					log.Printf("[BOT] ⚠️ Failed to get Claude response during auto-flush: %v", err)
+				} else if response != "" {
+					// Send Claude's response to the DM
+					b.sendClaudeResponseToDM(response)
+					if b.config.Debug {
+						log.Printf("[BOT] Sent Claude auto-response to DM (%d chars)", len(response))
+					}
+				}
 			}
 		case <-b.stopAutoFlush:
 			if b.config.Debug {

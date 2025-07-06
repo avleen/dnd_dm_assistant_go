@@ -48,6 +48,9 @@ Guidelines:
 - Don't make decisions for the DM - offer options and suggestions
 - Pay attention to the ongoing conversation context
 - The DM or others may ask you questions directly by addressing you as CLAUDE, so be ready to respond
+- When you see rule questions, confusion, or requests for help in the transcriptions, feel free to offer assistance
+- Only respond when you have something genuinely helpful to contribute
+- If there's nothing that needs your input, you can stay silent
 
 The conversation below represents the ongoing D&D session. Recent transcriptions will show as "[TRANSCRIPTION] SSRC <number>: <text>" where each SSRC represents a different speaker.`
 )
@@ -172,6 +175,73 @@ func (cm *ConversationManager) AskQuestion(question string) (string, error) {
 
 	if cm.debug {
 		log.Printf("[CLAUDE] Got response (%d chars)", len(responseText))
+	}
+
+	return responseText, nil
+}
+
+// FlushTranscriptionsAndRespond flushes buffered transcriptions and gets Claude's response
+func (cm *ConversationManager) FlushTranscriptionsAndRespond() (string, error) {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+
+	if len(cm.transcriptionBuf) == 0 {
+		return "", nil // No transcriptions to flush
+	}
+
+	// Combine all buffered transcriptions into a single user message
+	content := strings.Join(cm.transcriptionBuf, "\n")
+	transcriptionMsg := CreateUserMessage(content)
+	cm.messages = append(cm.messages, transcriptionMsg)
+	cm.transcriptionBuf = cm.transcriptionBuf[:0] // Clear buffer
+
+	if cm.debug {
+		log.Printf("[CLAUDE] Flushed transcriptions to conversation and requesting response (total messages: %d)", len(cm.messages))
+	}
+
+	// Prepare messages for API (exclude system messages from the message array)
+	apiMessages := make([]Message, 0, len(cm.messages))
+	for _, msg := range cm.messages {
+		if msg.Role != "system" {
+			apiMessages = append(apiMessages, msg)
+		}
+	}
+
+	// Send to Claude for analysis/response
+	response, err := cm.service.SendMessage(apiMessages, cm.systemPrompt)
+	if err != nil {
+		// Save the conversation even if Claude request failed
+		if saveErr := cm.saveToDisk(); saveErr != nil {
+			log.Printf("[CLAUDE] ⚠️ Failed to save conversation after flush: %v", saveErr)
+		}
+		return "", fmt.Errorf("failed to get response from Claude: %w", err)
+	}
+
+	// Extract response text
+	responseText := GetResponseText(response)
+	if responseText == "" {
+		// Save the conversation even if no response
+		cm.trimMessages()
+		if err := cm.saveToDisk(); err != nil {
+			log.Printf("[CLAUDE] ⚠️ Failed to save conversation: %v", err)
+		}
+		return "", nil // No response from Claude
+	}
+
+	// Add Claude's response to the conversation
+	assistantMsg := CreateAssistantMessage(responseText)
+	cm.messages = append(cm.messages, assistantMsg)
+
+	// Trim messages if needed
+	cm.trimMessages()
+
+	// Save to disk
+	if err := cm.saveToDisk(); err != nil {
+		log.Printf("[CLAUDE] ⚠️ Failed to save conversation: %v", err)
+	}
+
+	if cm.debug {
+		log.Printf("[CLAUDE] Got auto-response (%d chars)", len(responseText))
 	}
 
 	return responseText, nil
