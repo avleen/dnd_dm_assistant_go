@@ -292,12 +292,4 @@ Enable debug logging by setting `DEBUG=true` in your `.env` file. This will prov
 
 ## 📄 License
 
-[Include your license information here]
-
-## 🤝 Contributing
-
-[Include contribution guidelines here]
-
-## 📞 Support
-
-[Include support/contact information here]
+See [LICENSE](LICENSE)
