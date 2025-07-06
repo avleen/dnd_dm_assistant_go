@@ -3,11 +3,10 @@ package speech
 import (
 	"context"
 	"fmt"
-	"io"
 	"log"
 
-	speech "cloud.google.com/go/speech/apiv2"
-	speechpb "cloud.google.com/go/speech/apiv2/speechpb"
+	speech "cloud.google.com/go/speech/apiv1p1beta1"
+	speechpb "cloud.google.com/go/speech/apiv1p1beta1/speechpb"
 )
 
 // Service handles speech-to-text operations using Google Cloud Speech-to-Text v2 API
@@ -38,73 +37,74 @@ func NewService(projectID string, debug bool) (*Service, error) {
 	}, nil
 }
 
-// StreamingRecognizeConfig creates the configuration for streaming recognition
-func (s *Service) createStreamingConfig() *speechpb.StreamingRecognitionConfig {
-	return &speechpb.StreamingRecognitionConfig{
-		Config: &speechpb.RecognitionConfig{
-			// Use auto-detect for audio encoding
-			DecodingConfig: &speechpb.RecognitionConfig_AutoDecodingConfig{
-				AutoDecodingConfig: &speechpb.AutoDetectDecodingConfig{},
-			},
-			LanguageCodes: []string{"en-US"},
-			Model:         "latest_long", // Chirp model for conversational speech
-			Features: &speechpb.RecognitionFeatures{
-				EnableAutomaticPunctuation: true,
-				EnableWordConfidence:       true,
-				EnableWordTimeOffsets:      true,
-			},
-		},
-		StreamingFeatures: &speechpb.StreamingRecognitionFeatures{
-			EnableVoiceActivityEvents: true,
-			InterimResults:            true,
-		},
+// createRecognitionConfig creates the configuration for recognition
+func (s *Service) createRecognitionConfig() *speechpb.RecognitionConfig {
+	return &speechpb.RecognitionConfig{
+		Model:                 "latest_long",
+		Encoding:              speechpb.RecognitionConfig_OGG_OPUS,
+		SampleRateHertz:       48000,
+		AudioChannelCount:     2,
+		EnableWordTimeOffsets: true,
+		EnableWordConfidence:  true,
+		LanguageCode:          "en-US",
 	}
 }
 
-// StartStreaming creates a new streaming recognition session
-func (s *Service) StartStreaming() (*StreamingSession, error) {
-	recognizer := fmt.Sprintf("projects/%s/locations/global/recognizers/_", s.projectID)
+// RecognizeAudio performs recognition on audio data using the REST API
+func (s *Service) RecognizeAudio(audioData []byte) (*TranscriptionResult, error) {
+	config := s.createRecognitionConfig()
 
-	stream, err := s.client.StreamingRecognize(s.ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create streaming recognize: %w", err)
-	}
-
-	// Send the initial configuration
-	config := s.createStreamingConfig()
-	configRequest := &speechpb.StreamingRecognizeRequest{
-		Recognizer: recognizer,
-		StreamingRequest: &speechpb.StreamingRecognizeRequest_StreamingConfig{
-			StreamingConfig: config,
+	audio := &speechpb.RecognitionAudio{
+		AudioSource: &speechpb.RecognitionAudio_Content{
+			Content: audioData,
 		},
 	}
 
-	if err := stream.Send(configRequest); err != nil {
-		return nil, fmt.Errorf("failed to send config: %w", err)
+	request := &speechpb.RecognizeRequest{
+		Config: config,
+		Audio:  audio,
 	}
 
-	session := &StreamingSession{
-		stream:  stream,
-		service: s,
+	if s.debug {
+		log.Printf("Sending %d bytes of audio data to Google Speech REST API", len(audioData))
 	}
 
-	// Start listening for responses
-	go session.listen()
+	response, err := s.client.Recognize(s.ctx, request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to recognize audio: %w", err)
+	}
 
-	return session, nil
+	if s.debug {
+		log.Printf("Received response with %d results", len(response.Results))
+	}
+
+	// Process the first result if available
+	if len(response.Results) > 0 && len(response.Results[0].Alternatives) > 0 {
+		result := response.Results[0]
+		alt := result.Alternatives[0]
+
+		transcriptionResult := &TranscriptionResult{
+			Transcript:  alt.Transcript,
+			Confidence:  alt.Confidence,
+			IsFinal:     true, // REST API results are always final
+			WordDetails: alt.Words,
+			Language:    result.LanguageCode,
+		}
+
+		if s.debug {
+			log.Printf("Transcription: %s (confidence: %.2f)", transcriptionResult.Transcript, transcriptionResult.Confidence)
+		}
+
+		return transcriptionResult, nil
+	}
+
+	return nil, fmt.Errorf("no transcription results received")
 }
 
 // Close closes the speech service
 func (s *Service) Close() error {
 	s.cancel()
 	return s.client.Close()
-}
-
-// StreamingSession represents an active streaming recognition session
-type StreamingSession struct {
-	stream     speechpb.Speech_StreamingRecognizeClient
-	service    *Service
-	ResultChan chan *TranscriptionResult
 }
 
 // TranscriptionResult contains the transcription results
@@ -115,88 +115,4 @@ type TranscriptionResult struct {
 	Speaker     int32
 	WordDetails []*speechpb.WordInfo
 	Language    string
-}
-
-// SendAudio sends PCM audio data to the streaming session
-func (s *StreamingSession) SendAudio(audioData []byte) error {
-	request := &speechpb.StreamingRecognizeRequest{
-		StreamingRequest: &speechpb.StreamingRecognizeRequest_Audio{
-			Audio: audioData,
-		},
-	}
-
-	return s.stream.Send(request)
-}
-
-// listen listens for streaming responses
-func (s *StreamingSession) listen() {
-	s.ResultChan = make(chan *TranscriptionResult, 10)
-	defer close(s.ResultChan)
-
-	for {
-		response, err := s.stream.Recv()
-		if err == io.EOF {
-			if s.service.debug {
-				log.Printf("Speech streaming ended")
-			}
-			return
-		}
-		if err != nil {
-			if s.service.debug {
-				log.Printf("Error receiving from speech stream: %v", err)
-			}
-			return
-		}
-
-		// Process the response
-		if response.Results != nil {
-			for _, result := range response.Results {
-				if len(result.Alternatives) > 0 {
-					alt := result.Alternatives[0]
-
-					transcriptionResult := &TranscriptionResult{
-						Transcript:  alt.Transcript,
-						Confidence:  alt.Confidence,
-						IsFinal:     result.IsFinal,
-						WordDetails: alt.Words,
-						Language:    result.LanguageCode,
-					}
-
-					// Extract speaker information if available
-					if len(alt.Words) > 0 && alt.Words[0].SpeakerLabel != "" {
-						// Parse speaker label (usually in format "speaker_0", "speaker_1", etc.)
-						var speaker int32
-						if _, err := fmt.Sscanf(alt.Words[0].SpeakerLabel, "speaker_%d", &speaker); err == nil {
-							transcriptionResult.Speaker = speaker
-						}
-					}
-
-					select {
-					case s.ResultChan <- transcriptionResult:
-						if s.service.debug {
-							finalText := ""
-							if transcriptionResult.IsFinal {
-								finalText = " [FINAL]"
-							}
-							log.Printf("Speech result%s: %s (confidence: %.2f)",
-								finalText, transcriptionResult.Transcript, transcriptionResult.Confidence)
-						}
-					default:
-						// Channel is full, skip this result
-						if s.service.debug {
-							log.Printf("Speech result channel full, dropping result")
-						}
-					}
-				}
-			}
-		}
-	}
-}
-
-// Close closes the streaming session
-func (s *StreamingSession) Close() error {
-	if s.ResultChan != nil {
-		close(s.ResultChan)
-	}
-	return s.stream.CloseSend()
 }

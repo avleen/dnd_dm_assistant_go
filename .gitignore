@@ -38,3 +38,6 @@ Thumbs.db
 .env
 .vscode/
 dnd_dm_assistant
+
+# Temporary files
+*.ogg

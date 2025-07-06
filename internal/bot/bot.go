@@ -79,7 +79,7 @@ func New(cfg *config.Config) (*Bot, error) {
 	}
 
 	// Create audio processor
-	audioProcessor := audio.New(cfg.Debug)
+	audioProcessor := audio.New(cfg.Debug, speechService)
 
 	bot := &Bot{
 		config:         cfg,
@@ -167,11 +167,22 @@ func (b *Bot) onVoiceStateUpdate(s *discordgo.Session, vsu *discordgo.VoiceState
 		return
 	}
 
+	// Get the previous channel ID
+	var previousChannelID string
+	if vsu.BeforeUpdate != nil {
+		previousChannelID = vsu.BeforeUpdate.ChannelID
+	}
+
+	// Only act if the channel actually changed, not on mute/unmute
+	if vsu.ChannelID == previousChannelID {
+		return
+	}
+
 	// Check if DM joined the target voice channel
 	if vsu.ChannelID == b.config.DNDVoiceChannelID {
 		log.Printf("DM joined the D&D voice channel, joining...")
 		b.joinVoiceChannel(vsu.GuildID, vsu.ChannelID)
-	} else if vsu.BeforeUpdate != nil && vsu.BeforeUpdate.ChannelID == b.config.DNDVoiceChannelID {
+	} else if previousChannelID == b.config.DNDVoiceChannelID {
 		log.Printf("DM left the D&D voice channel, leaving...")
 		b.leaveVoiceChannel(vsu.GuildID)
 	}
